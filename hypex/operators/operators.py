@@ -14,6 +14,7 @@ from ..dataset import (
     FeatureRole,
     InfoRole,
     TargetRole,
+    TreatmentRole,
 )
 from ..extensions.scipy_stats import NormCDF
 from ..utils.enums import ExperimentDataEnum
@@ -22,15 +23,264 @@ from .abstract import GroupOperator
 
 
 class SMD(GroupOperator):
-    def execute(self, data: ExperimentData) -> ExperimentData:
-        pass
+    """
+    Standardized Mean Difference between control and test groups.
+
+    By default:
+        - TreatmentRole is used to split observations into control/test groups;
+        - FeatureRole columns are used as variables for SMD calculation;
+        - control group is encoded as 0;
+        - test group is encoded as 1.
+
+    For every feature:
+
+        SMD = (mean_test - mean_control) / pooled_std
+    """
+
+    def __init__(
+        self,
+        grouping_role: ABCRole | None = None,
+        target_roles: ABCRole | list[ABCRole] | None = None,
+        control_value: Any = 0,
+        test_value: Any = 1,
+        key: Any = "",
+    ):
+        super().__init__(
+            grouping_role=grouping_role or TreatmentRole(),
+            target_roles=target_roles or FeatureRole(),
+            key=key,
+        )
+
+        self.control_value = control_value
+        self.test_value = test_value
+
+    def _get_fields(
+        self,
+        data: ExperimentData,
+    ) -> tuple[list[str], list[str]]:
+        """
+        Get treatment field and features.
+
+        GroupOperator._get_fields() assumes two target columns,
+        which is not appropriate for SMD: SMD should support
+        an arbitrary number of features.
+        """
+
+        group_field = data.field_search(self.grouping_role)
+
+        target_fields = data.field_search(
+            self.target_roles,
+            search_types=self.search_types,
+        )
+
+        return group_field, target_fields
+
+    def calculate(
+        self,
+        data: ExperimentData,
+    ) -> dict[str, float]:
+        """Calculate SMD for each selected feature."""
+        group_field, target_fields = self._get_fields(data=data)
+        if not group_field:
+            raise ValueError(
+                "SMD requires a grouping column "
+                "(TreatmentRole by default)."
+            )
+        if not target_fields:
+            raise ValueError(
+                "SMD requires at least one feature "
+                "(FeatureRole by default)."
+            )
+        return self.calc(
+            data=data.ds,
+            group_field=group_field,
+            target_fields=target_fields,
+            control_value=self.control_value,
+            test_value=self.test_value,
+        )
+    def execute(
+        self,
+        data: ExperimentData,
+    ) -> ExperimentData:
+        """Calculate SMD and store the result in ExperimentData."""
+        _, target_fields = self._get_fields(data=data)
+        if not target_fields and data.ds.tmp_roles:
+            return data
+        self.key = str(
+            target_fields[0]
+            if len(target_fields) == 1
+            else (target_fields or "")
+        )
+        compare_result = self.calculate(data)
+        return self._set_value(
+            data,
+            compare_result,
+        )
+
+
+    @classmethod
+    def _execute_inner_function(
+        cls,
+        grouping_data,
+        target_fields: list[str] | None = None,
+        control_value: Any = 0,
+        test_value: Any = 1,
+        **kwargs,
+    ) -> dict[str, float]:
+        """
+        Calculate one SMD for each feature.
+
+        grouping_data contains two datasets:
+            control group
+            test group
+        """
+
+        if not target_fields:
+            raise ValueError(
+                "SMD requires at least one feature."
+            )
+
+        if len(grouping_data) != 2:
+            raise ValueError(
+                "SMD requires exactly 2 groups "
+                f"(control and test), got {len(grouping_data)}."
+            )
+
+        groups = {}
+
+        for group_key, group_data in grouping_data:
+            # Dataset.groupby() may return keys as one-element tuples.
+            if (
+                isinstance(group_key, (tuple, list))
+                and len(group_key) == 1
+            ):
+                group_key = group_key[0]
+
+            groups[group_key] = group_data
+
+        if control_value not in groups:
+            raise ValueError(
+                f"Control group {control_value!r} was not found. "
+                f"Available groups: {list(groups.keys())}"
+            )
+
+        if test_value not in groups:
+            raise ValueError(
+                f"Test group {test_value!r} was not found. "
+                f"Available groups: {list(groups.keys())}"
+            )
+
+        control_data = groups[control_value]
+        test_data = groups[test_value]
+
+        result = {}
+
+        for field in target_fields:
+            result[field] = cls._inner_function(
+                data=control_data[field],
+                test_data=test_data[field],
+                **kwargs,
+            )
+
+        return result
+
+    @staticmethod
+    def _to_numpy(
+        data: Dataset,
+    ) -> np.ndarray:
+        """
+        Convert a single-column Dataset to a 1D float NumPy array.
+        """
+
+        values = data.data
+
+        # pandas DataFrame / Series
+        if hasattr(values, "to_numpy"):
+            values = values.to_numpy()
+
+        values = np.asarray(
+            values,
+            dtype=float,
+        ).reshape(-1)
+
+        # pandas mean()/var() normally ignore NaN,
+        # so preserve equivalent behaviour here.
+        values = values[~np.isnan(values)]
+
+        return values
 
     @classmethod
     def _inner_function(
-        cls, data: Dataset, test_data: Dataset | None = None, **kwargs
-    ) -> Any:
-        test_data = cls._check_test_data(test_data=test_data)
-        return (data.mean() + test_data.mean()) / data.std()
+        cls,
+        data: Dataset,
+        test_data: Dataset | None = None,
+        **kwargs,
+    ) -> float:
+        """
+        Calculate signed Standardized Mean Difference:
+
+            (mean_test - mean_control) / pooled_std
+
+        Sample variances are calculated with ddof=1.
+        """
+
+        test_data = cls._check_test_data(
+            test_data=test_data
+        )
+
+        control = cls._to_numpy(data)
+        test = cls._to_numpy(test_data)
+
+        n_control = control.size
+        n_test = test.size
+
+        if n_control < 2 or n_test < 2:
+            raise ValueError(
+                "SMD requires at least 2 observations "
+                "in both control and test groups."
+            )
+
+        mean_control = np.mean(control)
+        mean_test = np.mean(test)
+
+        var_control = np.var(
+            control,
+            ddof=1,
+        )
+        var_test = np.var(
+            test,
+            ddof=1,
+        )
+
+        pooled_variance = (
+            (n_control - 1) * var_control
+            + (n_test - 1) * var_test
+        ) / (
+            n_control + n_test - 2
+        )
+
+        pooled_std = np.sqrt(
+            pooled_variance
+        )
+
+        mean_difference = (
+            mean_test - mean_control
+        )
+
+        # Explicit NumPy division gives mathematically natural
+        # behaviour for zero variance:
+        #   non-zero difference / 0 -> +/-inf
+        #   0 / 0                   -> nan
+        with np.errstate(
+            divide="ignore",
+            invalid="ignore",
+        ):
+            smd = np.divide(
+                mean_difference,
+                pooled_std,
+            )
+
+        return float(smd)
 
 
 class MatchingMetrics(GroupOperator):
