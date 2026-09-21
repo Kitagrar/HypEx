@@ -75,47 +75,48 @@ class SMD(GroupOperator):
 
         return group_field, target_fields
 
-    def execute(
+    def calculate(
         self,
         data: ExperimentData,
-    ) -> ExperimentData:
-
+    ) -> dict[str, float]:
+        """Calculate SMD for each selected feature."""
         group_field, target_fields = self._get_fields(data=data)
-
         if not group_field:
             raise ValueError(
                 "SMD requires a grouping column "
                 "(TreatmentRole by default)."
             )
-
         if not target_fields:
-            # Preserve the previous HypEx behaviour for temporary roles.
-            if data.ds.tmp_roles:
-                return data
-
             raise ValueError(
                 "SMD requires at least one feature "
                 "(FeatureRole by default)."
             )
-
-        self.key = str(
-            target_fields[0]
-            if len(target_fields) == 1
-            else target_fields
-        )
-
-        compare_result = self.calc(
+        return self.calc(
             data=data.ds,
             group_field=group_field,
             target_fields=target_fields,
             control_value=self.control_value,
             test_value=self.test_value,
         )
-
+    def execute(
+        self,
+        data: ExperimentData,
+    ) -> ExperimentData:
+        """Calculate SMD and store the result in ExperimentData."""
+        _, target_fields = self._get_fields(data=data)
+        if not target_fields and data.ds.tmp_roles:
+            return data
+        self.key = str(
+            target_fields[0]
+            if len(target_fields) == 1
+            else (target_fields or "")
+        )
+        compare_result = self.calculate(data)
         return self._set_value(
             data,
             compare_result,
         )
+
 
     @classmethod
     def _execute_inner_function(
